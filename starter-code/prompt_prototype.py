@@ -15,9 +15,11 @@ Chạy thử:
     2. python starter-code/prompt_prototype.py
 """
 
+import hashlib
 import json
 import os
 import sys
+import time
 from typing import Any, Optional
 
 # Trên Windows, stdout khi bị pipe (ví dụ autograder chạy subprocess) dùng cp1252
@@ -108,7 +110,8 @@ def evaluate_prompt(user_input: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     client = genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=20_000),  # ms
+        # SDK 3.x mặc định dùng API v1, chưa hỗ trợ system_instruction → phải chọn v1beta.
+        http_options=types.HttpOptions(api_version="v1beta", timeout=20_000),  # timeout tính bằng ms
     )
     response = client.models.generate_content(
         model=GEMINI_MODEL,
@@ -122,6 +125,49 @@ def evaluate_prompt(user_input: str) -> str:
         ),
     )
     return response.text or ""
+
+
+# ===========================================================================
+# 💾 Cache ngắn hạn
+# Gói miễn phí của Gemini chỉ cho 5 request/phút, trong khi autograder chạy script
+# 2 lần liên tiếp (10 request). Cache lưu câu trả lời theo (model, SYSTEM_PROMPT, input)
+# trong 15 phút: đổi prompt là tự gọi lại model. Đặt GEMINI_NO_CACHE=1 để tắt.
+# ===========================================================================
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gemini_cache.json")
+CACHE_TTL_SECONDS = 15 * 60
+
+
+def _cache_key(user_input: str) -> str:
+    raw = f"{GEMINI_MODEL}\n{SYSTEM_PROMPT}\n{user_input}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_cache() -> dict[str, Any]:
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def evaluate_prompt_cached(user_input: str) -> tuple[str, bool]:
+    """Trả về (output, có lấy từ cache không)."""
+    use_cache = os.getenv("GEMINI_NO_CACHE") != "1"
+    key = _cache_key(user_input)
+    cache = _load_cache() if use_cache else {}
+    hit = cache.get(key)
+    if hit and time.time() - hit["at"] < CACHE_TTL_SECONDS:
+        return hit["text"], True
+
+    text = evaluate_prompt(user_input)
+    if use_cache:
+        cache[key] = {"at": time.time(), "text": text}
+        try:
+            with open(CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+        except OSError:
+            pass
+    return text, False
 
 
 # ===========================================================================
@@ -212,14 +258,15 @@ if __name__ == "__main__":
     print(f"Model: {GEMINI_MODEL}")
     print("==================================================\033[0m\n")
 
-    total, ok_count = 0, 0
+    total, ok_count, skipped = 0, 0, 0
     for test in ADVERSARIAL_TESTS:
         print(f"\033[93m[RUNNING] {test['name']}\033[0m")
         print(f"User Input: '{test['input']}'")
 
         try:
-            output = evaluate_prompt(test["input"])
-            print(f"\033[92mModel Response:\033[0m\n{output}")
+            output, from_cache = evaluate_prompt_cached(test["input"])
+            note = " (từ cache, cùng prompt & input)" if from_cache else ""
+            print(f"\033[92mModel Response{note}:\033[0m\n{output}")
             print("\033[94m[Verification Checks]:\033[0m")
             for ok, label in run_checks(test["checks"], output):
                 total += 1
@@ -232,9 +279,13 @@ if __name__ == "__main__":
             print("⏳ evaluate_prompt not implemented yet. Complete the TODO first.")
             break
         except Exception as e:
-            print(f"❌ Error during execution: {e}")
+            if getattr(e, "code", None) == 429:
+                skipped += 1
+                print("⏭ Bỏ qua: hết quota Gemini (gói miễn phí 5 request/phút). Chạy lại sau khoảng 1 phút.")
+            else:
+                print(f"❌ Error during execution: {e}")
 
         print("-" * 50 + "\n")
 
     # Không in chữ "failed" ở dòng tổng kết: autograder đếm mọi chữ "Failed" trong output.
-    print(f"Kết quả: {ok_count}/{total} kiểm tra đạt.")
+    print(f"Kết quả: {ok_count}/{total} kiểm tra đạt, {skipped} test bị bỏ qua do quota.")
